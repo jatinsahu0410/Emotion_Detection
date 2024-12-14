@@ -1,0 +1,5 @@
+pandas
+mediapipe 
+deepface
+flask
+CORS
