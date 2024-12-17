@@ -3,3 +3,4 @@ mediapipe
 deepface
 flask
 CORS
+tf_keras
