@@ -6,49 +6,135 @@ import time
 import base64
 from flask_cors import CORS
 import logging
+import platform
+import json
+from typing import Dict, Any, List
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
-def initialize_camera():
-    """Try different camera indices and return working camera."""
-    for index in range(10):  # Try first 10 camera indices
-        cap = cv2.VideoCapture(index)
+def get_windows_cameras() -> List[Dict[str, Any]]:
+    """Get available cameras on Windows using OpenCV."""
+    cameras = []
+    # Try the first 10 camera indices
+    for i in range(10):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)  # Use DirectShow on Windows
         if cap.isOpened():
-            return cap, index
-    return None, None
+            ret, frame = cap.read()
+            cameras.append({
+                "index": i,
+                "working": ret and frame is not None,
+                "resolution": str(frame.shape) if ret and frame is not None else None
+            })
+        cap.release()
+    return cameras
 
-def get_camera_list():
-    """Get list of available video devices on Linux."""
+def get_linux_cameras() -> List[Dict[str, Any]]:
+    """Get available cameras on Linux systems."""
+    cameras = []
+    # Check /dev/video* devices
+    for i in range(10):
+        device_path = f"/dev/video{i}"
+        if os.path.exists(device_path):
+            cap = cv2.VideoCapture(i)
+            ret, frame = cap.read()
+            cameras.append({
+                "path": device_path,
+                "index": i,
+                "working": ret and frame is not None,
+                "resolution": str(frame.shape) if ret and frame is not None else None,
+                "permissions": oct(os.stat(device_path).st_mode)[-3:]
+            })
+            cap.release()
+    return cameras
+
+def get_system_info() -> Dict[str, Any]:
+    """Gather system information for debugging."""
+    info = {
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "opencv_version": cv2.__version__,
+        "user": os.getenv('USER'),
+        "pwd": os.getcwd(),
+        "environment": os.environ.get('FLASK_ENV', 'development')
+    }
+    
+    # Platform-specific camera detection
+    if platform.system() == 'Windows':
+        info['cameras'] = get_windows_cameras()
+    else:  # Linux
+        info['cameras'] = get_linux_cameras()
+    
+    # Test default camera (index 0)
     try:
-        video_devices = []
-        for i in range(10):
-            device_path = f"/dev/video{i}"
-            if os.path.exists(device_path):
-                video_devices.append(device_path)
-        return video_devices
+        if platform.system() == 'Windows':
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(0)
+            
+        info['opencv_camera_open'] = cap.isOpened()
+        if cap.isOpened():
+            ret, frame = cap.read()
+            info['opencv_frame_read'] = ret
+            info['frame_shape'] = str(frame.shape) if ret and frame is not None else None
+        else:
+            info['opencv_frame_read'] = False
+        cap.release()
     except Exception as e:
-        logger.error(f"Error getting camera list: {str(e)}")
-        return []
+        info['opencv_error'] = str(e)
+    
+    return info
 
 @app.route('/camera-check', methods=['GET'])
 def check_camera():
-    """Endpoint to check camera availability and configuration."""
-    camera_info = {
-        "available_devices": get_camera_list(),
-        "opencv_version": cv2.__version__,
-        "environment": os.environ.get('FLASK_ENV', 'development')
-    }
-    return jsonify(camera_info)
+    """Enhanced endpoint to check camera availability and system configuration."""
+    try:
+        system_info = get_system_info()
+        return jsonify(system_info)
+    except Exception as e:
+        logger.error(f"Error in camera check: {str(e)}")
+        return jsonify({
+            "error": str(e),
+            "partial_info": get_system_info()
+        })
+
+@app.route('/test-capture', methods=['GET'])
+def test_capture():
+    """Test endpoint to try capturing a single frame."""
+    try:
+        if platform.system() == 'Windows':
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(0)
+            
+        if not cap.isOpened():
+            return jsonify({"error": "Failed to open camera"}), 500
+            
+        ret, frame = cap.read()
+        cap.release()
+        
+        if not ret or frame is None:
+            return jsonify({"error": "Failed to capture frame"}), 500
+            
+        return jsonify({
+            "success": True,
+            "frame_shape": str(frame.shape),
+            "frame_type": str(frame.dtype)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error capturing frame: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/capture-emotion', methods=['GET', 'POST'])
 def capture_emotion():
+    """Main endpoint for emotion detection from camera or uploaded image."""
     try:
-        # If image is provided in POST request, use it instead of capturing
+        # Handle image upload if provided
         if request.method == 'POST' and 'image' in request.files:
             image_file = request.files['image']
             image_path = f"uploaded_image_{int(time.time())}.jpg"
@@ -56,49 +142,61 @@ def capture_emotion():
             frame = cv2.imread(image_path)
             
         else:
-            # Initialize the webcam with fallback options
-            webcam, camera_index = initialize_camera()
-            if webcam is None:
-                return jsonify({"error": "No working camera found", 
-                              "available_devices": get_camera_list()}), 500
+            # Platform-specific camera initialization
+            if platform.system() == 'Windows':
+                webcam = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            else:
+                webcam = cv2.VideoCapture(0)
+                
+            if not webcam.isOpened():
+                return jsonify({"error": "Failed to open camera"}), 500
 
-            logger.info(f"Successfully opened camera at index {camera_index}")
-            
-            # Try to read frame with multiple attempts
+            # Multiple attempts to read frame
             max_attempts = 3
+            frame = None
             for attempt in range(max_attempts):
                 ret, frame = webcam.read()
                 if ret and frame is not None:
                     break
+                logger.warning(f"Attempt {attempt + 1} failed to capture frame")
                 time.sleep(0.5)
-            
-            if not ret or frame is None:
-                webcam.release()
-                return jsonify({"error": "Failed to capture image after multiple attempts"}), 500
 
+            webcam.release()
+            
+            if frame is None:
+                return jsonify({"error": "Failed to capture frame after multiple attempts"}), 500
+
+            # Save frame temporarily
             image_path = f"captured_image_{int(time.time())}.jpg"
             cv2.imwrite(image_path, frame)
-            webcam.release()
 
         try:
             # Analyze the image for emotions
-            analysis = DeepFace.analyze(img_path=image_path, 
-                                      actions=['emotion'], 
-                                      detector_backend='mtcnn',
-                                      enforce_detection=False)  # Added to prevent face detection errors
+            analysis = DeepFace.analyze(
+                img_path=image_path, 
+                actions=['emotion'], 
+                detector_backend='mtcnn',
+                enforce_detection=False
+            )
             
             emotions = analysis[0]['emotion']
             dominant_emotion = analysis[0]['dominant_emotion']
 
-            # Update the dominant emotion based on thresholds
-            if emotions['sad'] > 5:
+            # Apply emotion thresholds
+            if emotions['sad'] > 30:
                 dominant_emotion = 'sad'
             elif emotions['angry'] > 30:
                 dominant_emotion = 'angry'
 
-            # Convert the image to Base64
-            with open(image_path, 'rb') as img_file:
-                img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+            # Convert to base64
+            _, buffer = cv2.imencode('.jpg', frame)
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+            return jsonify({
+                "dominant_emotion": dominant_emotion,
+                "emotions": emotions,
+                "captured_image": img_base64
+            })
 
         except Exception as e:
             logger.error(f"Error during emotion analysis: {str(e)}")
@@ -109,23 +207,11 @@ def capture_emotion():
             if os.path.exists(image_path):
                 os.remove(image_path)
 
-        return jsonify({
-            "dominant_emotion": dominant_emotion,
-            "emotions": emotions,
-            "captured_image": img_base64
-        })
-
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
 if __name__ == '__main__':
-    # Check camera availability at startup
-    camera, index = initialize_camera()
-    if camera is not None:
-        camera.release()
-        logger.info(f"Camera check passed - working camera found at index {index}")
-    else:
-        logger.warning("No working camera found at startup")
-    
+    logger.info("Starting Flask application...")
+    logger.info(f"System info: {json.dumps(get_system_info(), indent=2)}")
     app.run(host='0.0.0.0', port=5000, debug=True)
